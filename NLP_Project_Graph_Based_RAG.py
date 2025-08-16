@@ -1,0 +1,491 @@
+import base64
+import os
+import re
+
+import nomic
+import numpy as np
+import ollama
+import pandas as pd
+from langchain_community.graphs import Neo4jGraph
+from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
+from langchain_core.documents import Document
+from langchain_experimental.graph_transformers.llm import LLMGraphTransformer
+from langchain_ollama.llms import OllamaLLM
+from neo4j import GraphDatabase
+from nomic import embed
+from ollama import chat
+from yfiles_jupyter_graphs_for_neo4j import Neo4jGraphWidget
+
+# import deeplake
+# ds = deeplake.load('hub://activeloop/flickr30k')
+
+
+NEO4J_SERVER_URL = "bolt://localhost:7687"
+NEO4J_DB_NAME = "ragdb"
+NEO4J_LOGIN = os.environ["NEO4J_USER_LOGIN"]
+NEO4J_PWD = os.environ["NEO4J_USER_PWD"]
+
+
+TEXT_EMBEDDING_MODEL = "DC1LEX/nomic-embed-text-v1.5-multimodal"
+VISION_EMBEDDING_MODEL = "nomic-embed-vision-v1.5"
+MULTIMODAL_INFERENCE_MODEL = "gemma3:4b"
+MULTIMODAL_LLAVA_MODEL = "llava:7b"
+
+
+RAG_DATA_FILENAME = "rag_data.csv"
+RAG_DATA_IMG_COL_NAME = "image_filename"
+RAG_DATA_DOC_COL_NAME = "doc"
+RAG_IMG_FOLDER = "images"
+RAG_MAX_GRAPH_DEPTH = 2
+RAG_QUERY_NUM_TOP_RESULTS = 3
+USER_QUERY_IMAGE_SEARCH_FOLDER = "user_image_search"
+
+
+def get_rag_img_path(filename):
+    local_path = f"{RAG_IMG_FOLDER}/{filename}"
+    if os.path.isfile(local_path):
+        return local_path
+    else:
+        print(f"File {local_path} does not exist or is not a file.")
+
+
+def get_user_img_search_path(filename):
+    local_path = f"{USER_QUERY_IMAGE_SEARCH_FOLDER}/{filename}"
+    if os.path.isfile(local_path):
+        return local_path
+    else:
+        print(f"File {local_path} does not exist or is not a file.")
+
+
+def encode_image(img_path):
+    encoded_image = None
+
+    with open(img_path, "rb") as f:
+        encoded_image = base64.b64encode(f.read()).decode("utf-8")
+
+    return encoded_image
+
+
+def encode_images(img_paths):
+    return [encode_image(img_path) for img_path in img_paths]
+
+
+ollama.pull(TEXT_EMBEDDING_MODEL)
+ollama.pull(MULTIMODAL_INFERENCE_MODEL)
+ollama.pull(MULTIMODAL_LLAVA_MODEL)
+
+
+def get_img_embedding(img_path):
+    nomic_api_key = os.environ["NOMIC_API_KEY"]
+
+    nomic.login(nomic_api_key)
+
+    output = embed.image(
+        images=[img_path],
+        model=VISION_EMBEDDING_MODEL,
+    )
+
+    # print(output['usage'])
+    img_embeddings = np.array(output["embeddings"])
+    # print(img_embeddings)
+    # print(img_embeddings.shape)
+
+    return img_embeddings[0]
+
+
+def get_text_embedding(txt):
+    response = ollama.embed(model=TEXT_EMBEDDING_MODEL, input=txt)
+    txt_embedding = response["embeddings"]
+    return txt_embedding[0]
+
+
+def get_node_from_text_prop(graph_doc, txt):
+    # result = None
+    for node in graph_doc.nodes:
+        txt_value = node.properties.get("text")
+        if txt_value is not None and txt_value == txt:
+            return node
+    return None
+
+
+def main_mllm_txt_search(txt_search, ctx):
+    response = chat(
+        model=MULTIMODAL_INFERENCE_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Answer the question while taking into account the context. \n question:{txt_search} \n context:{ctx}",
+                # "images":[img_b64]
+            }
+        ],
+    )
+
+    result = response["message"]["content"]
+    return result
+
+
+def get_query_mllm_img_desc(instruction, file_path):
+    try:
+        # Ensure the image exists and is accessible
+        with open(file_path, "rb") as f:
+            image_data = f.read()
+
+        result = ollama.generate(
+            model=MULTIMODAL_LLAVA_MODEL,
+            prompt=instruction,
+            images=[image_data],  # Pass image data directly
+            stream=False,
+        )
+        # print(result['response'])
+        return result["response"]
+    except FileNotFoundError:
+        print(f"Error: Image file not found at {file_path}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+def get_node_text(node):
+    node_txt = node.get("text")
+    if node_txt is not None:
+        return node_txt
+    else:
+        return node.get("id")
+
+
+def format_context_for_rag(neo4j_results):
+    context_list = []
+    for record in neo4j_results:
+        # Extract relevant information from the record
+        source_entity = record["a"]
+        relationships = record["r"]
+        # Format the extracted information into a string or structured data
+        # suitable for your RAG model
+
+        relationships_txt_list = [
+            f" {relationship.type} {get_node_text(relationship.nodes[0])}"
+            for relationship in relationships
+        ]
+        context_string = (
+            f"{get_node_text(source_entity)} {" ".join(relationships_txt_list)}"
+        )
+
+        # print(f"Context string : {context_string}")
+
+        context_list.append(context_string)
+    return "\n".join(context_list)
+
+
+def temp_copy_graph_query_result(session, record):
+
+    for value in record.values():
+        # If it's a node
+
+        if hasattr(value, "labels"):
+            props = ", ".join(f"{k}: {repr(v)}" for k, v in dict(value).items())
+            node_query = f"""
+                MERGE (n:TempViz:{re.sub(r"\s+", "_", list(value.labels)[0])} {{element_id:"{value.element_id}"}})
+                SET n += {{{props}}}
+            """
+            session.run(node_query)
+
+    for value in record.values():
+        # If it's a relationship
+        if hasattr(value, "type"):
+            start_id = value.nodes[0].element_id
+            end_id = value.nodes[1].element_id
+
+            props = ", ".join(f"{k}: {repr(v)}" for k, v in dict(value).items())
+            rel_query = f"""
+                MATCH (a:TempViz {{element_id:"{start_id}"}}), (b:TempViz {{element_id:"{end_id}"}})
+                MERGE (a)-[r:{value.type}]->(b)
+                SET r += {{{props}}}
+            """
+            session.run(rel_query)
+
+    for value in record.values():
+        # If it's a list of relationships
+        if isinstance(value, list):
+
+            for rel in value:
+
+                start_id = rel.nodes[0].element_id
+                end_id = rel.nodes[1].element_id
+
+                props = ", ".join(f"{k}: {repr(v)}" for k, v in dict(rel).items())
+                rel_query = f"""
+                    MATCH (a:TempViz {{element_id:"{start_id}"}}), (b:TempViz {{element_id:"{end_id}"}})
+                    MERGE (a)-[r:{rel.type}]->(b)
+                    SET r += {{{props}}}
+                """
+                session.run(rel_query)
+
+
+def visualize_result_with_yfiles(result):
+    """
+    Push nodes/relationships from a neo4j.Result to a temporary in-memory graph
+    and display them with Neo4jGraphWidget.
+    """
+    driver = GraphDatabase.driver(
+        uri=NEO4J_SERVER_URL, database=NEO4J_DB_NAME, auth=(NEO4J_LOGIN, NEO4J_PWD)
+    )
+    with driver.session() as session:
+        # Clear a temporary namespace (label:TempViz)
+        session.run("MATCH (n:TempViz) DETACH DELETE n")
+
+        for record in result:
+            # print(f"Record : {record}")
+            temp_copy_graph_query_result(session, record)
+
+    # Now visualize just the TempViz graph
+    widget = Neo4jGraphWidget(driver)
+    widget.show_cypher(
+        """
+        MATCH (n:TempViz)-[r]->(m:TempViz)
+        RETURN n, r, m
+    """,
+        layout="hierarchic",
+    )
+    driver.close()
+
+
+def visualize_all_graph_with_yfiles():
+    driver = GraphDatabase.driver(
+        uri=NEO4J_SERVER_URL, database=NEO4J_DB_NAME, auth=(NEO4J_LOGIN, NEO4J_PWD)
+    )
+    neo4j_subgraph = Neo4jGraphWidget(driver)
+
+    neo4j_subgraph.show_cypher(
+        "MATCH (s)-[r]->(t) RETURN s,r,t LIMIT 40", layout="hierarchic"
+    )
+    driver.close()
+
+
+def get_main_mllm_img_desc(img_path):
+    img_b64 = encode_image(img_path)
+    response = chat(
+        model=MULTIMODAL_INFERENCE_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": "Describe all people, organizations, and events in this image.",
+                "images": [img_b64],
+            }
+        ],
+    )
+
+    image_description = response["message"]["content"]
+    return image_description
+
+
+# Function to run a Cypher query
+def run_query(query, parameters=None):
+    # Create a driver instance
+    driver = GraphDatabase.driver(
+        uri=NEO4J_SERVER_URL, database=NEO4J_DB_NAME, auth=(NEO4J_LOGIN, NEO4J_PWD)
+    )
+    tobereturned = []
+    with driver.session() as session:
+        result = session.run(query, parameters or {})
+        tobereturned = [record for record in result]
+    driver.close()
+    return tobereturned
+
+
+def search_from_txt_with_rag_context(search, max_graph_depth=1, num_top_results=3):
+
+    # Get RAG context
+    query = f"""
+    MATCH (a)-[r*1..{max_graph_depth}]->(b)
+    WITH a, b, gds.similarity.cosine(a.embedding, $query_embeddings) AS similarity, r
+    ORDER BY similarity DESC
+    LIMIT $top_k
+    RETURN a, r, b
+    """
+
+    params = {"query_embeddings": get_text_embedding(search), "top_k": num_top_results}
+    rag_subgraph = run_query(query, params)
+
+    # Print results
+    # for record in results:
+    # print(record)
+    # Format RAG context
+    search_ctx = format_context_for_rag(rag_subgraph)
+
+    # Query llm with rag context
+    return main_mllm_txt_search(search, search_ctx), rag_subgraph
+
+
+def search_from_img_with_rag_context(img_path, max_graph_depth=1, num_top_results=3):
+
+    instruction = "What is depicted in this image ?"
+    img_txt = get_query_mllm_img_desc(instruction, img_path)
+
+    return search_from_txt_with_rag_context(img_txt, max_graph_depth, num_top_results)
+
+
+def preprocess_data(text_docs, img_data):
+
+    # Preprocess textual data
+    docs = [
+        Document(page_content=txt, metadata={"embedding": get_text_embedding(txt)})
+        for txt in text_docs[RAG_DATA_DOC_COL_NAME]
+    ]
+
+    img_docs = [
+        Document(
+            page_content=img_desc,
+            metadata={
+                "url": get_rag_img_path(img_name),
+                "embedding": get_text_embedding(img_desc),
+            },
+        )
+        for img_desc, img_name in zip(
+            img_data[RAG_DATA_DOC_COL_NAME], img_data[RAG_DATA_IMG_COL_NAME]
+        )
+    ]
+
+    # Gather all preprocessed data
+    docs.extend(img_docs)
+
+    return docs
+
+
+def extracted_graph_post_treatment(graph_docs):
+
+    # Add embeddings to the nodes of the graph
+    for graph_doc in graph_docs:
+
+        for node in graph_doc.nodes:
+            node_text = node.properties.get("text")
+            if node_text is not None:
+                node.properties["embedding"] = get_text_embedding(node_text)
+            else:
+                node_id = node.id
+                if node_id is not None:
+                    node.properties["embedding"] = get_text_embedding(node_id)
+
+    # Add Image nodes with properties like embedding then relate to the rest of the graph
+    img_id = 0
+
+    for graph_doc in graph_docs:
+        # If the source of the graphDoc is the description of an image
+        graph_source = graph_doc.source
+        img_url = graph_source.metadata.get("url")
+
+        if img_url is not None:
+            # print(img_url)
+            # Créer un noeud image avec l'URL en question et l'embedding de l'image
+            img_node = Node(
+                id=f"img_{img_id}",
+                type="Image",
+                properties={"url": img_url, "embedding": get_img_embedding(img_url)},
+            )
+
+            new_relationships = []
+
+            # Lier l'image à tous les noeuds du grapheDoc
+            for node in graph_doc.nodes:
+                new_relationships.append(
+                    Relationship(source=img_node, target=node, type="contains")
+                )
+
+            graph_doc.nodes.append(img_node)
+            graph_doc.relationships.extend(new_relationships)
+            img_id += 1
+
+    return graph_docs
+
+
+def populate_neo4j_graph():
+
+    raw_data_df = pd.read_csv(RAG_DATA_FILENAME, sep=",")
+
+    # Preprocess all data
+    docs = preprocess_data(
+        raw_data_df[raw_data_df[RAG_DATA_IMG_COL_NAME].isna()],
+        raw_data_df[raw_data_df[RAG_DATA_IMG_COL_NAME].notna()],
+    )
+
+    # Normal Ollama LLM for graph extraction
+    llm = OllamaLLM(model=MULTIMODAL_INFERENCE_MODEL, temperature=0.0)
+
+    transformer = LLMGraphTransformer(
+        llm=llm,
+        # allowed_nodes=["Person", "Organization", "Event"],
+        # node_properties=True
+    )
+
+    # 3. Extract graph
+    graph_docs = transformer.convert_to_graph_documents(docs)
+    graph_docs = extracted_graph_post_treatment(graph_docs)
+
+    # Empty graph
+    driver = GraphDatabase.driver(
+        uri=NEO4J_SERVER_URL, database=NEO4J_DB_NAME, auth=(NEO4J_LOGIN, NEO4J_PWD)
+    )
+    with driver.session() as session:
+
+        session.run("MATCH (n) DETACH DELETE n")
+    driver.close()
+
+    # Store Knowledge Graph in Neo4j
+    graph_store = Neo4jGraph(
+        url=NEO4J_SERVER_URL,
+        username=NEO4J_LOGIN,
+        password=NEO4J_PWD,
+        database=NEO4J_DB_NAME,
+    )
+    # graph_store.write_graph(graph_docs)
+
+    graph_store.add_graph_documents(graph_docs, include_source=True)
+
+
+if __name__ == "__main__":
+
+    populate_neo4j_graph()
+
+
+if __name__ == "__main__":
+    # Query 1
+    search1 = "Where does Alice work?"
+
+    # Query 2
+    search2 = "Who works for OpenWidgets?"
+
+    search3 = "black"
+    search4 = "describe happy people"
+
+    search_result, rag_subgraph = search_from_txt_with_rag_context(
+        search4,
+        max_graph_depth=RAG_MAX_GRAPH_DEPTH,
+        num_top_results=RAG_QUERY_NUM_TOP_RESULTS,
+    )
+    file_path = get_user_img_search_path(
+        "Man.jpg"
+    )  # Replace with the actual path to your image
+    img_search_result, img_rag_subgraph = search_from_img_with_rag_context(
+        file_path,
+        max_graph_depth=RAG_MAX_GRAPH_DEPTH,
+        num_top_results=RAG_QUERY_NUM_TOP_RESULTS,
+    )
+
+
+if __name__ == "__main__":
+    print(search_result)
+
+
+if __name__ == "__main__":
+    print(img_search_result)
+
+
+if __name__ == "__main__":
+    visualize_result_with_yfiles(rag_subgraph)
+
+
+if __name__ == "__main__":
+    visualize_result_with_yfiles(img_rag_subgraph)
+
+
+if __name__ == "__main__":
+
+    visualize_all_graph_with_yfiles()
