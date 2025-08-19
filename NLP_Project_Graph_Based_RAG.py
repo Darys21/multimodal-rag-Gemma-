@@ -37,7 +37,7 @@ RAG_DATA_IMG_COL_NAME = "image_filename"
 RAG_DATA_DOC_COL_NAME = "doc"
 RAG_IMG_FOLDER = "images"
 RAG_MAX_GRAPH_DEPTH = 2
-RAG_QUERY_NUM_TOP_RESULTS = 3
+RAG_QUERY_NUM_TOP_RESULTS = 6
 USER_QUERY_IMAGE_SEARCH_FOLDER = "user_image_search"
 
 
@@ -158,6 +158,7 @@ def format_context_for_rag(neo4j_results):
         # Extract relevant information from the record
         source_entity = record["a"]
         relationships = record["r"]
+
         # Format the extracted information into a string or structured data
         # suitable for your RAG model
 
@@ -193,7 +194,7 @@ def temp_copy_graph_query_result(session, record):
         if hasattr(value, "type"):
             start_id = value.nodes[0].element_id
             end_id = value.nodes[1].element_id
-
+            # print("simple relationship")
             props = ", ".join(f"{k}: {repr(v)}" for k, v in dict(value).items())
             rel_query = f"""
                 MATCH (a:TempViz {{element_id:"{start_id}"}}), (b:TempViz {{element_id:"{end_id}"}})
@@ -205,12 +206,15 @@ def temp_copy_graph_query_result(session, record):
     for value in record.values():
         # If it's a list of relationships
         if isinstance(value, list):
-
+            # print("list relationship")
+            # print(f"Rels : {value}")
             for rel in value:
 
                 start_id = rel.nodes[0].element_id
                 end_id = rel.nodes[1].element_id
-
+                # print(f"Rel : {rel}")
+                # print(f"Rel start id : {start_id}")
+                # print(f"Rel end id : {end_id}")
                 props = ", ".join(f"{k}: {repr(v)}" for k, v in dict(rel).items())
                 rel_query = f"""
                     MATCH (a:TempViz {{element_id:"{start_id}"}}), (b:TempViz {{element_id:"{end_id}"}})
@@ -319,7 +323,7 @@ def search_from_img_with_rag_context(img_path, max_graph_depth=1, num_top_result
 
     instruction = "What is depicted in this image ?"
     img_txt = get_query_mllm_img_desc(instruction, img_path)
-
+    # print("Image search")
     return search_from_txt_with_rag_context(img_txt, max_graph_depth, num_top_results)
 
 
@@ -443,7 +447,6 @@ def populate_neo4j_graph():
 if __name__ == "__main__":
 
     populate_neo4j_graph()
-
 
 if __name__ == "__main__":
     # Query 1
