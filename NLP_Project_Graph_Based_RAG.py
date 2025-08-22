@@ -1,11 +1,15 @@
 import base64
+import io
 import os
 import re
+import uuid
 
+import matplotlib.pyplot as plt
 import nomic
 import numpy as np
 import ollama
 import pandas as pd
+from datasets import load_dataset
 from langchain_community.graphs import Neo4jGraph
 from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
 from langchain_core.documents import Document
@@ -15,10 +19,6 @@ from neo4j import GraphDatabase
 from nomic import embed
 from ollama import chat
 from yfiles_jupyter_graphs_for_neo4j import Neo4jGraphWidget
-
-# import deeplake
-# ds = deeplake.load('hub://activeloop/flickr30k')
-
 
 NEO4J_SERVER_URL = "bolt://localhost:7687"
 NEO4J_DB_NAME = "ragdb"
@@ -41,8 +41,25 @@ RAG_QUERY_NUM_TOP_RESULTS = 6
 USER_QUERY_IMAGE_SEARCH_FOLDER = "user_image_search"
 
 
+BENCH_DATA_IMG_COL_NAME = "image"
+BENCH_DATA_GT_IMG_COL_NAME = "gt_images"
+BENCH_DATA_QUESTION_COL_NAME = "question"
+BENCH_DATA_CHOICE_A_COL_NAME = "A"
+BENCH_DATA_CHOICE_B_COL_NAME = "B"
+BENCH_DATA_CHOICE_C_COL_NAME = "C"
+BENCH_DATA_CHOICE_D_COL_NAME = "D"
+BENCH_DATA_ANSWER_CHOICE_COL_NAME = "answer_choice"
+BENCH_DATA_ANSWER_TEXT_COL_NAME = "answer"
+BENCH_DATA_BASE_SUBSET_SIZE = 10
+
+
+ollama.pull(TEXT_EMBEDDING_MODEL)
+ollama.pull(MULTIMODAL_INFERENCE_MODEL)
+ollama.pull(MULTIMODAL_LLAVA_MODEL)
+
+
 def get_rag_img_path(filename):
-    local_path = f"{RAG_IMG_FOLDER}/{filename}"
+    local_path = os.path.join(RAG_IMG_FOLDER, filename)
     if os.path.isfile(local_path):
         return local_path
     else:
@@ -70,9 +87,23 @@ def encode_images(img_paths):
     return [encode_image(img_path) for img_path in img_paths]
 
 
-ollama.pull(TEXT_EMBEDDING_MODEL)
-ollama.pull(MULTIMODAL_INFERENCE_MODEL)
-ollama.pull(MULTIMODAL_LLAVA_MODEL)
+def save_img_to_folder(folder, image_data):
+    img_name = f"{uuid.uuid4()}.png"
+
+    img_path = os.path.join(folder, img_name)
+
+    image_data.save(img_path)
+
+    return img_path
+
+
+def format_query_question(base_question, option_a, option_b, option_c, option_d):
+    return f"""{base_question}.
+    Simply state the answer you choose among the following options :
+    - {option_a}
+    - {option_b}
+    - {option_c}
+    - {option_d}"""
 
 
 def get_img_embedding(img_path):
@@ -281,6 +312,17 @@ def get_main_mllm_img_desc(img_path):
     return image_description
 
 
+def main_mllm_img_with_query_search(img_path, query):
+    img_b64 = encode_image(img_path)
+    response = chat(
+        model=MULTIMODAL_INFERENCE_MODEL,
+        messages=[{"role": "user", "content": query, "images": [img_b64]}],
+    )
+
+    result = response["message"]["content"]
+    return result
+
+
 # Function to run a Cypher query
 def run_query(query, parameters=None):
     # Create a driver instance
@@ -319,12 +361,41 @@ def search_from_txt_with_rag_context(search, max_graph_depth=1, num_top_results=
     return main_mllm_txt_search(search, search_ctx), rag_subgraph
 
 
-def search_from_img_with_rag_context(img_path, max_graph_depth=1, num_top_results=3):
+def search_query_mllm_from_img_with_rag_context(
+    img_path, max_graph_depth=1, num_top_results=3
+):
 
     instruction = "What is depicted in this image ?"
     img_txt = get_query_mllm_img_desc(instruction, img_path)
     # print("Image search")
     return search_from_txt_with_rag_context(img_txt, max_graph_depth, num_top_results)
+
+
+def search_main_mllm_from_img_with_query_and_rag_context(
+    img_path, user_query, max_graph_depth=1, num_top_results=3
+):
+
+    # Get RAG context
+    query = f"""
+    MATCH (a)-[r*1..{max_graph_depth}]->(b)
+    WITH a, b, gds.similarity.cosine(a.embedding, $query_embeddings) AS similarity, r
+    ORDER BY similarity DESC
+    LIMIT $top_k
+    RETURN a, r, b
+    """
+
+    params = {"query_embeddings": get_img_embedding(img_path), "top_k": num_top_results}
+    rag_subgraph = run_query(query, params)
+
+    # Print results
+    # for record in results:
+    # print(record)
+    # Format RAG context with initial user query
+    search_ctx = f"""question : {user_query}
+                    context from image : {format_context_for_rag(rag_subgraph)}"""
+
+    # Query llm with rag context
+    return main_mllm_img_with_query_search(img_path, search_ctx), rag_subgraph
 
 
 def preprocess_data(text_docs, img_data):
@@ -354,6 +425,39 @@ def preprocess_data(text_docs, img_data):
     return docs
 
 
+def preprocess_benchmark_data(img_data):
+
+    # Preprocess textual data
+    # docs = [Document(page_content=txt, metadata={"embedding":get_text_embedding(txt)}) for txt in text_docs[RAG_DATA_DOC_COL_NAME]]
+    img_docs = []
+    rec_num = 1
+    for imgs in img_data:
+        print(f"Record num : {rec_num}")
+        print(f"Num ground truth images : {len(imgs)}")
+        # There are 5 ground truth images, but we limit to 3 for the sake of computation limitation
+        for img in imgs[:3]:
+
+            img_path = save_img_to_folder(RAG_IMG_FOLDER, img)
+
+            img_desc = get_main_mllm_img_desc(img_path)
+            img_docs.append(
+                Document(
+                    page_content=img_desc,
+                    metadata={
+                        "url": img_path,
+                        "embedding": get_text_embedding(img_desc),
+                    },
+                )
+            )
+
+        rec_num += 1
+
+    # Gather all preprocessed data
+    # docs.extend(img_docs)
+
+    return img_docs
+
+
 def extracted_graph_post_treatment(graph_docs):
 
     # Add embeddings to the nodes of the graph
@@ -380,7 +484,7 @@ def extracted_graph_post_treatment(graph_docs):
             # print(img_url)
             # Créer un noeud image avec l'URL en question et l'embedding de l'image
             img_node = Node(
-                id=f"img_{img_id}",
+                id=f"img_{uuid.uuid4()}",
                 type="Image",
                 properties={"url": img_url, "embedding": get_img_embedding(img_url)},
             )
@@ -444,9 +548,168 @@ def populate_neo4j_graph():
     graph_store.add_graph_documents(graph_docs, include_source=True)
 
 
+def populate_neo4j_graph_from_benchmark_ds(ds):
+
+    raw_data_df = ds
+
+    # Preprocess all data
+    docs = preprocess_benchmark_data(raw_data_df[BENCH_DATA_GT_IMG_COL_NAME])
+
+    # Normal Ollama LLM for graph extraction
+    llm = OllamaLLM(model=MULTIMODAL_INFERENCE_MODEL, temperature=0.0)
+
+    transformer = LLMGraphTransformer(
+        llm=llm,
+        # allowed_nodes=["Person", "Organization", "Event"],
+        # node_properties=True
+    )
+
+    # 3. Extract graph
+    graph_docs = transformer.convert_to_graph_documents(docs)
+    graph_docs = extracted_graph_post_treatment(graph_docs)
+
+    # Store Knowledge Graph in Neo4j
+    graph_store = Neo4jGraph(
+        url=NEO4J_SERVER_URL,
+        username=NEO4J_LOGIN,
+        password=NEO4J_PWD,
+        database=NEO4J_DB_NAME,
+    )
+
+    graph_store.add_graph_documents(graph_docs, include_source=True)
+
+    graph_store._driver.close()
+
+
 if __name__ == "__main__":
 
-    populate_neo4j_graph()
+    ds = load_dataset("uclanlp/MRAG-Bench")
+    # populate_neo4j_graph()
+
+
+# Empty graph
+"""
+driver = GraphDatabase.driver(uri=NEO4J_SERVER_URL, database=NEO4J_DB_NAME, auth=(NEO4J_LOGIN,NEO4J_PWD))
+with driver.session() as session:
+
+    session.run("MATCH (n) DETACH DELETE n")
+driver.close()
+
+for i in range(BENCH_DATA_BASE_SUBSET_SIZE):
+    #View top data 
+    subset = ds["test"].select([i])
+
+    print(subset)
+
+
+    populate_neo4j_graph_from_benchmark_ds(subset)
+     
+    """
+if __name__ == "__main__":
+    simple_search_results = []
+    rag_1_search_results = []
+    rag_2_search_results = []
+    rag_3_search_results = []
+
+    subset = ds["test"].select(range(BENCH_DATA_BASE_SUBSET_SIZE))
+
+    for record in subset:
+        query_img = record[BENCH_DATA_IMG_COL_NAME]
+        base_question = record[BENCH_DATA_QUESTION_COL_NAME]
+        option_a = record[BENCH_DATA_CHOICE_A_COL_NAME]
+        option_b = record[BENCH_DATA_CHOICE_B_COL_NAME]
+        option_c = record[BENCH_DATA_CHOICE_C_COL_NAME]
+        option_d = record[BENCH_DATA_CHOICE_D_COL_NAME]
+        right_answer = record[BENCH_DATA_ANSWER_TEXT_COL_NAME]
+
+        query_question = format_query_question(
+            base_question, option_a, option_b, option_c, option_d
+        )
+        query_img_path = save_img_to_folder(USER_QUERY_IMAGE_SEARCH_FOLDER, query_img)
+
+        simple_search = main_mllm_img_with_query_search(query_img_path, query_question)
+        rag_1_search, img_rag_1_subgraph = (
+            search_main_mllm_from_img_with_query_and_rag_context(
+                query_img_path,
+                query_question,
+                max_graph_depth=1,
+                num_top_results=RAG_QUERY_NUM_TOP_RESULTS,
+            )
+        )
+        rag_2_search, img_rag_2_subgraph = (
+            search_main_mllm_from_img_with_query_and_rag_context(
+                query_img_path,
+                query_question,
+                max_graph_depth=2,
+                num_top_results=RAG_QUERY_NUM_TOP_RESULTS,
+            )
+        )
+        rag_3_search, img_rag_3_subgraph = (
+            search_main_mllm_from_img_with_query_and_rag_context(
+                query_img_path,
+                query_question,
+                max_graph_depth=3,
+                num_top_results=RAG_QUERY_NUM_TOP_RESULTS,
+            )
+        )
+
+        print(simple_search)
+        print(rag_1_search)
+        print(rag_2_search)
+        print(rag_3_search)
+
+        simple_search_results.append(simple_search == right_answer)
+        rag_1_search_results.append(rag_1_search == right_answer)
+        rag_2_search_results.append(rag_2_search == right_answer)
+        rag_3_search_results.append(rag_3_search == right_answer)
+
+    global_search_results = [
+        simple_search_results,
+        rag_1_search_results,
+        rag_2_search_results,
+        rag_3_search_results,
+    ]
+
+    global_num_good_answers = [sum(answers) for answers in global_search_results]
+
+
+if __name__ == "__main__":
+    print([elem for elem in subset[BENCH_DATA_ANSWER_TEXT_COL_NAME]])
+
+
+if __name__ == "__main__":
+    print([elem for elem in subset[BENCH_DATA_QUESTION_COL_NAME]])
+
+
+if __name__ == "__main__":
+
+    # The labels for your x-axis
+    x_labels = ["Simple", "RAG_1", "RAG_2", "RAG_3"]
+
+    # Create a numerical list for the tick locations
+    x_positions = list(range(len(x_labels)))
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x_positions, global_num_good_answers)
+    plt.xticks(x_positions, x_labels)
+    plt.xlabel("Type of Search")
+    plt.ylabel("Number of good results")
+    plt.title("RAG search performance evaluation")
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    visualize_result_with_yfiles(img_rag_1_subgraph)
+
+
+if __name__ == "__main__":
+    visualize_result_with_yfiles(img_rag_2_subgraph)
+
+
+if __name__ == "__main__":
+    visualize_result_with_yfiles(img_rag_3_subgraph)
+
 
 if __name__ == "__main__":
     # Query 1
@@ -466,7 +729,7 @@ if __name__ == "__main__":
     file_path = get_user_img_search_path(
         "Man.jpg"
     )  # Replace with the actual path to your image
-    img_search_result, img_rag_subgraph = search_from_img_with_rag_context(
+    img_search_result, img_rag_subgraph = search_query_mllm_from_img_with_rag_context(
         file_path,
         max_graph_depth=RAG_MAX_GRAPH_DEPTH,
         num_top_results=RAG_QUERY_NUM_TOP_RESULTS,
@@ -492,3 +755,7 @@ if __name__ == "__main__":
 if __name__ == "__main__":
 
     visualize_all_graph_with_yfiles()
+
+
+# if __name__ == "__main__":
+# search_main_mllm_from_img_with_query_and_rag_context(img_path, user_query, max_graph_depth=1, num_top_results=3)

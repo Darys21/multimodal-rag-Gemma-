@@ -92,7 +92,7 @@ if submit_button:
             save_dir.mkdir(exist_ok=True)
             img_path = save_dir / uploaded_file.name
             Image.open(uploaded_file).save(img_path)
-            answer, subgraph = backend.search_from_img_with_rag_context(
+            answer, subgraph = backend.search_query_mllm_from_img_with_rag_context(
                 str(img_path), max_graph_depth=max_depth, num_top_results=top_k
             )
         else:
